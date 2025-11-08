@@ -6,7 +6,7 @@
 - 构建并运行SFT训练
 - 保存LoRA与合并后的权重
 
-用法示例：
+快速上手（一键式）：
 
 from medical_finetune_tool import MedicalFineTuneConfig, MedicalFineTuner
 
@@ -15,12 +15,30 @@ config = MedicalFineTuneConfig(
     data_dir="【数据集】中文医疗数据",
 )
 
-tool = MedicalFineTuner(config)
-tool.run(
+tuner = MedicalFineTuner(config)
+tuner.run(
     save_lora_dir="lora_model_medical",
     save_merged_dir="model_medical",  # 可选
     merged_method="merged_16bit",     # 可选：merged_16bit / merged_4bit
 )
+
+进阶示例（手动流程）：
+
+config = MedicalFineTuneConfig(
+    model_name="/root/autodl-tmp/models/Qwen/Qwen3-4B",
+    data_dir="【数据集】中文医疗数据",
+    max_steps=20,
+    num_train_epochs=1,
+)
+tuner = MedicalFineTuner(config)
+tuner.init_model()             # 加载模型与LoRA
+tuner.load_medical_data()      # 读取并清洗数据
+tuner.prepare_dataset()        # 应用提示模板，构造text字段
+tuner.create_trainer()         # 创建 SFTTrainer
+train_stats = tuner.train()    # 运行训练
+tuner.save_lora("lora_model_medical_demo")  # 保存LoRA
+# 可选：保存合并权重
+# tuner.save_merged("model_medical_demo", save_method="merged_16bit")
 
 """
 
@@ -39,7 +57,44 @@ import torch
 class MedicalFineTuneConfig:
     """可配置项，默认值与现有脚本保持一致。
 
-    字段的详细含义请参考下方的内联中文注释。
+    Attributes:
+        model_name: 基础模型目录（本地路径或HF模型名）。
+        max_seq_length: 最大序列长度（支持RoPE缩放）。
+        dtype: 精度类型；None表示自动（常见为float16/bfloat16）。
+        load_in_4bit: 是否使用4bit量化加载以节省显存。
+        local_files_only: 仅从本地缓存/目录加载模型，不联网下载。
+
+        lora_r: LoRA秩（推荐：8/16/32/64/128）。
+        lora_target_modules: 应用LoRA的模块列表（Q/K/V/O及MLP）。
+        lora_alpha: LoRA缩放因子。
+        lora_dropout: LoRA dropout；0通常更快。
+        lora_bias: LoRA对偏置的处理方式：none/all等。
+        use_gradient_checkpointing: 梯度检查点策略（unsloth可显著降显存）。
+        random_state: 随机种子，保证可重复性。
+        use_rslora: 是否启用Rank-Stabilized LoRA。
+        loftq_config: LoftQ配置（量化+LoRA联合），一般为None。
+
+        data_dir: 数据集根目录（包含各科室子目录）。
+        departments: 科室目录映射：子目录名 -> 中文名称（用于遍历与日志）。
+        max_qa_len: 问/答最大长度（字符数）；超出将被过滤。
+
+        per_device_train_batch_size: 每设备训练批次大小。
+        gradient_accumulation_steps: 梯度累积步数（等效增大总batch）。
+        warmup_steps: 学习率预热步数。
+        max_steps: 最大训练步数（与num_train_epochs配合使用）。
+        num_train_epochs: 训练轮数（若设置max_steps，则优先按步数停止）。
+        learning_rate: 学习率。
+        logging_steps: 日志打印步数间隔。
+        optim: 优化器类型（8bit优化器可降显存）。
+        weight_decay: 权重衰减。
+        lr_scheduler_type: 学习率调度策略。
+        seed: 全局随机种子。
+        output_dir: 训练输出目录。
+        report_to: 训练日志上报后端（none禁用）。
+        packing: 是否对短样本进行序列打包以提速。
+        dataset_num_proc: 数据集map并行进程数。
+
+        medical_prompt: 提示模板；使用 format(input, output) 生成训练文本。
     """
     # 模型与加载参数
     model_name: str = "/root/autodl-tmp/models/Qwen/Qwen3-4B"  # 基础模型目录（本地路径或HF模型名）
@@ -200,7 +255,11 @@ class MedicalFineTuner:
         return self.dataset
 
     def init_model(self) -> None:
-        """加载基础模型与分词器，并应用LoRA配置。"""
+        """加载基础模型与分词器，并应用LoRA配置。
+
+        Raises:
+            RuntimeError: 当模型或分词器加载失败时抛出。
+        """
         self.model, self.tokenizer = FastLanguageModel.from_pretrained(
             model_name=self.config.model_name,
             max_seq_length=self.config.max_seq_length,
@@ -225,7 +284,11 @@ class MedicalFineTuner:
         self._eos_token = self.tokenizer.eos_token
 
     def prepare_dataset(self) -> Dataset:
-        """根据提示模板将样本格式化为text字段，供SFT训练。"""
+        """根据提示模板将样本格式化为text字段，供SFT训练。
+
+        Raises:
+            RuntimeError: 当 tokenizer 未初始化时抛出（需先调用 init_model）。
+        """
         if self.dataset is None:
             self.load_medical_data()
 
@@ -357,30 +420,65 @@ class MedicalFineTuner:
 
         return stats
 
-if __name__ == "__main__":
-    # Demo 入口：通过环境变量覆盖关键配置以适配本机
-    # QWEN_MODEL_PATH: 基础模型目录；MEDICAL_DATA_DIR: 数据集根目录
-    # SAVE_MERGED_DIR: 可选，设置后会保存合并权重；MERGED_METHOD: merged_16bit/merged_4bit
+def demo_basic_usage() -> None:
+    """更完整的调用示例：手动控制各步骤与保存。
+
+    使用较小训练步数与epoch方便快速演示；根据需要调参。
+    """
     config = MedicalFineTuneConfig(
         model_name=os.environ.get("QWEN_MODEL_PATH", "/root/autodl-tmp/models/Qwen/Qwen3-4B"),
         data_dir=os.environ.get("MEDICAL_DATA_DIR", "【数据集】中文医疗数据"),
-        max_steps=20,           # 为演示降低训练步数
-        num_train_epochs=1,     # 为演示降低epoch数量
+        max_steps=20,
+        num_train_epochs=1,
         logging_steps=1,
     )
-
     tuner = MedicalFineTuner(config)
-    print("开始Demo训练（步数降低，仅供演示）...")
-    try:
-        stats = tuner.run(
-            save_lora_dir="lora_model_medical_demo",
-            save_merged_dir=os.environ.get("SAVE_MERGED_DIR") or None,
-            merged_method=os.environ.get("MERGED_METHOD", "merged_16bit"),
+    tuner.init_model()
+    tuner.load_medical_data()
+    tuner.prepare_dataset()
+    tuner.create_trainer()
+    stats = tuner.train()
+    print("手动流程训练统计：", stats)
+    tuner.save_lora("lora_model_medical_demo")
+    save_merged_dir = os.environ.get("SAVE_MERGED_DIR")
+    if save_merged_dir:
+        tuner.save_merged(save_merged_dir, os.environ.get("MERGED_METHOD", "merged_16bit"))
+        print(f"合并权重已保存到 `{save_merged_dir}`。")
+
+if __name__ == "__main__":
+    # Demo 入口：通过环境变量选择演示流程
+    # QWEN_MODEL_PATH: 基础模型目录；MEDICAL_DATA_DIR: 数据集根目录
+    # SAVE_MERGED_DIR: 可选，设置后会保存合并权重；MERGED_METHOD: merged_16bit/merged_4bit
+    # MEDICAL_DEMO_FLOW: 选择 `basic`（手动流程）或 `oneclick`（一键式），默认 oneclick
+    demo_flow = os.environ.get("MEDICAL_DEMO_FLOW", "oneclick").lower()
+
+    if demo_flow == "basic":
+        print("运行手动流程 Demo（步数降低，仅供演示）...")
+        try:
+            demo_basic_usage()
+        except Exception as e:
+            print("手动流程 Demo 运行失败：", e)
+            print("请检查模型路径与数据目录设置，并确认依赖已安装。")
+    else:
+        print("开始一键式 Demo（步数降低，仅供演示）...")
+        config = MedicalFineTuneConfig(
+            model_name=os.environ.get("QWEN_MODEL_PATH", "/root/autodl-tmp/models/Qwen/Qwen3-4B"),
+            data_dir=os.environ.get("MEDICAL_DATA_DIR", "【数据集】中文医疗数据"),
+            max_steps=20,           # 为演示降低训练步数
+            num_train_epochs=1,     # 为演示降低epoch数量
+            logging_steps=1,
         )
-        print("训练统计：", stats)
-        print("LoRA模型已保存到 `lora_model_medical_demo`。")
-        if os.environ.get("SAVE_MERGED_DIR"):
-            print(f"合并权重已保存到 `{os.environ.get('SAVE_MERGED_DIR')}`。")
-    except Exception as e:
-        print("Demo 运行失败：", e)
-        print("请检查模型路径与数据目录设置，并确认依赖已安装。")
+        tuner = MedicalFineTuner(config)
+        try:
+            stats = tuner.run(
+                save_lora_dir="lora_model_medical_demo",
+                save_merged_dir=os.environ.get("SAVE_MERGED_DIR") or None,
+                merged_method=os.environ.get("MERGED_METHOD", "merged_16bit"),
+            )
+            print("训练统计：", stats)
+            print("LoRA模型已保存到 `lora_model_medical_demo`。")
+            if os.environ.get("SAVE_MERGED_DIR"):
+                print(f"合并权重已保存到 `{os.environ.get('SAVE_MERGED_DIR')}`。")
+        except Exception as e:
+            print("一键式 Demo 运行失败：", e)
+            print("请检查模型路径与数据目录设置，并确认依赖已安装。")
