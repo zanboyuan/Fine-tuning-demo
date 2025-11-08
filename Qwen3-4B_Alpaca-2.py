@@ -1,5 +1,13 @@
 #!/usr/bin/env python
 # coding: utf-8
+"""
+脚本说明（中文）：
+- 使用 Unsloth 框架对 Qwen3-4B 进行监督微调（SFT），包含模型加载、LoRA 适配器配置、
+  Alpaca 格式数据集准备、训练、推理、LoRA 保存与重新加载、合并保存（16bit/4bit）、
+  以及 GGUF 导出示例。
+- 注意：本脚本为演示用途，路径如模型与数据集的本地位置需要按你的环境实际修改；
+  若未启用 CUDA 或显存不足，请调整 `max_seq_length`、batch 大小、是否 4bit 等参数。
+"""
 
 # ### 使用 Unsloth 框架对 Qwen3-4B 模型进行微调的示例代码
 # ### 本代码可以在免费的 Tesla T4 Google Colab 实例上运行 https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/Qwen2.5_(7B)-Alpaca.ipynb
@@ -11,26 +19,28 @@
 from unsloth import FastLanguageModel
 import torch
 
-# 设置模型参数
+# 设置模型参数（关键：根据你的 GPU 能力选择合适的配置）
 max_seq_length = 2048  # 设置最大序列长度，支持 RoPE 缩放
 dtype = None  # 数据类型，None 表示自动检测。Tesla T4 使用 Float16，Ampere+ 使用 Bfloat16
 load_in_4bit = True  # 使用 4bit 量化来减少内存使用
 
 # 加载预训练模型和分词器
 model, tokenizer = FastLanguageModel.from_pretrained(
-    #model_name = "unsloth/Qwen3-4B",  # 使用Qwen3-4B模型
-    model_name = "/root/autodl-tmp/models/Qwen/Qwen3-4B",  # 使用Qwen3-4B模型
+    # model_name 可使用 Hugging Face 名称（例如 "unsloth/Qwen3-4B"）或本地路径。
+    # 出于演示，这里使用本地路径；请按需修改为你的环境路径或在线仓库名。
+    # model_name = "unsloth/Qwen3-4B",  # 示例：在线仓库名
+    model_name = "/root/autodl-tmp/models/Qwen/Qwen3-4B",  # 示例：本地模型路径
     max_seq_length = max_seq_length,
     dtype = dtype,
     load_in_4bit = load_in_4bit,
-    local_files_only=True,  # 仅从本地文件加载模型，不尝试下载
+    local_files_only=True,  # 仅从本地文件加载模型，避免在受限环境下触发下载
 )
 
 
 # In[2]:
 
 
-# 添加LoRA适配器，只需要更新1-10%的参数
+# 添加 LoRA 适配器（关键：仅更新少量参数，显著降低微调成本）
 model = FastLanguageModel.get_peft_model(
     model, # Qwen3-4B
     r = 16,  # LoRA秩，建议使用8、16、32、64、128
@@ -39,7 +49,7 @@ model = FastLanguageModel.get_peft_model(
     lora_alpha = 16,  # LoRA缩放因子
     lora_dropout = 0,  # LoRA dropout率，0为优化设置
     bias = "none",    # 偏置项设置，none为优化设置
-    use_gradient_checkpointing = "unsloth",  # 使用unsloth的梯度检查点，可减少30%显存使用
+    use_gradient_checkpointing = "unsloth",  # 使用梯度检查点，可减少约30%显存使用
     random_state = 3407,  # 随机种子
     use_rslora = False,  # 是否使用rank stabilized LoRA
     loftq_config = None,  # LoftQ配置
@@ -47,7 +57,7 @@ model = FastLanguageModel.get_peft_model(
 
 
 # ### 数据准备
-# 定义Alpaca格式的提示模板
+# 定义 Alpaca 格式的提示模板（注意：这是训练/推理文本的结构，不建议改动关键词）
 alpaca_prompt = """Below is an instruction that describes a task, 
 paired with an input that provides further context. 
 Write a response that appropriately completes the request.
@@ -61,10 +71,10 @@ Write a response that appropriately completes the request.
 ### Response:
 {}"""
 
-# 获取结束标记
+# 获取结束标记（关键：生成任务需要 EOS，避免无穷生成）
 EOS_TOKEN = tokenizer.eos_token
 
-# 定义数据格式化函数
+# 定义数据格式化函数：将 instruction/input/output 拼接为可训练文本，并追加 EOS
 def formatting_prompts_func(examples):
     instructions = examples["instruction"]
     inputs       = examples["input"]
@@ -76,7 +86,8 @@ def formatting_prompts_func(examples):
         texts.append(text)
     return { "text" : texts, }
 
-# 加载Alpaca数据集
+# 加载 Alpaca 数据集（可替换为 Hugging Face 仓库名或本地路径）
+# 例如：`yahma/alpaca-cleaned`（在线）或本地目录路径。
 from datasets import load_dataset
 dataset = load_dataset("/root/autodl-tmp/datasets/yahma/alpaca-cleaned", split = "train")
 dataset = dataset.map(formatting_prompts_func, batched = True,)
@@ -84,7 +95,7 @@ dataset = dataset.map(formatting_prompts_func, batched = True,)
 
 # ### 模型训练
 
-# 设置训练参数和训练器
+# 设置训练参数和训练器（关键：根据显存/速度需求调整 batch、accumulation、max_steps 等）
 from trl import SFTTrainer
 from transformers import TrainingArguments
 from unsloth import is_bfloat16_supported
@@ -96,8 +107,8 @@ training_args = TrainingArguments(
         warmup_steps = 5,  # 预热步数
         max_steps = 60,  # 最大训练步数
         learning_rate = 2e-4,  # 学习率
-        fp16 = not is_bfloat16_supported(),  # 是否使用FP16
-        bf16 = is_bfloat16_supported(),  # 是否使用BF16
+        fp16 = not is_bfloat16_supported(),  # 是否使用 FP16（若不支持 BF16）
+        bf16 = is_bfloat16_supported(),  # 是否使用 BF16（若硬件支持更推荐）
         logging_steps = 1,  # 日志记录步数
         optim = "adamw_8bit",  # 优化器
         weight_decay = 0.01,  # 权重衰减
@@ -115,7 +126,7 @@ trainer = SFTTrainer(
     dataset_text_field = "text",
     max_seq_length = max_seq_length,
     dataset_num_proc = 2,
-    packing = False,  # 对于短序列可以设置为True，训练速度提升5倍
+    packing = False,  # 短序列场景可设为 True，提高吞吐；长序列建议保持 False
     args = training_args,
 )
 
@@ -123,7 +134,7 @@ trainer = SFTTrainer(
 # In[5]:
 
 
-# 显示当前GPU内存状态
+# 显示当前 GPU 内存状态（便于评估显存占用与是否需要调小参数）
 gpu_stats = torch.cuda.get_device_properties(0)
 start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
 max_memory = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
@@ -134,14 +145,14 @@ print(f"{start_gpu_memory} GB of memory reserved.")
 # In[6]:
 
 
-# 开始训练
+# 开始训练（返回训练统计信息，含运行时长等）
 trainer_stats = trainer.train()
 
 
 # In[7]:
 
 
-# 显示训练后的内存和时间统计
+# 显示训练后的显存与时间统计（关键：观察 LoRA 训练额外显存占用比例）
 used_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
 used_memory_for_lora = round(used_memory - start_gpu_memory, 3)
 used_percentage = round(used_memory / max_memory * 100, 3)
@@ -159,8 +170,9 @@ print(f"Peak reserved memory for training % of max memory = {lora_percentage} %.
 # In[8]:
 
 
-# 模型推理部分
-FastLanguageModel.for_inference(model)  # 启用原生2倍速推理
+# 模型推理（一次性生成）：
+# 先启用 Unsloth 原生 2x 推理加速，再按模板构造输入并生成输出。
+FastLanguageModel.for_inference(model)  # 启用原生 2x 推理
 inputs = tokenizer(
 [
     alpaca_prompt.format(
@@ -178,7 +190,7 @@ tokenizer.batch_decode(outputs)
 # In[9]:
 
 
-# 使用TextStreamer进行连续推理
+# 使用 TextStreamer 进行连续推理（流式打印到终端，适合长文本）
 FastLanguageModel.for_inference(model)
 inputs = tokenizer(
 [
@@ -200,15 +212,15 @@ _ = model.generate(**inputs, streamer = text_streamer, max_new_tokens = 128)
 # In[10]:
 
 
-# 保存模型
-model.save_pretrained("lora_model")  # 本地保存
+# 保存 LoRA 适配器与分词器（注意：仅保存 LoRA 权重，不是完整基础模型）
+model.save_pretrained("lora_model")
 tokenizer.save_pretrained("lora_model")
 
 
 # In[11]:
 
 
-# 加载保存的模型进行推理
+# 加载保存的 LoRA 模型进行推理（演示重新加载后的使用方式）
 if True:
     from unsloth import FastLanguageModel
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -219,7 +231,7 @@ if True:
     )
     FastLanguageModel.for_inference(model)  # 启用原生2倍速推理
 
-# 使用保存的模型进行推理示例
+# 使用重新加载的模型进行推理示例（流式输出）
 inputs = tokenizer(
 [
     alpaca_prompt.format(
@@ -239,7 +251,7 @@ _ = model.generate(**inputs, streamer = text_streamer, max_new_tokens = 128)
 # In[15]:
 
 
-# 使用Hugging Face的AutoModelForPeftCausalLM加载模型（不推荐，因为速度较慢）
+# 使用 Hugging Face 的 AutoPeftModelForCausalLM 加载模型（不推荐：下载与推理速度较慢）
 if False:
     from peft import AutoPeftModelForCausalLM
     from transformers import AutoTokenizer
@@ -250,9 +262,11 @@ if False:
     tokenizer = AutoTokenizer.from_pretrained("lora_model")
 
 
-# ### Saving to float16 for VLLM
+# ### 保存为 float16（用于 VLLM）
 # 
-# We also support saving to `float16` directly. Select `merged_16bit` for float16 or `merged_4bit` for int4. We also allow `lora` adapters as a fallback. Use `push_to_hub_merged` to upload to your Hugging Face account! You can go to https://huggingface.co/settings/tokens for your personal tokens.
+# 支持直接保存为 `float16`（选择 `merged_16bit`）或 `int4`（选择 `merged_4bit`）。
+# 也可仅保存 `lora` 适配器作为回退方案。若需推送到 Hugging Face，
+# 可使用 `push_to_hub_merged` 并在 https://huggingface.co/settings/tokens 获取个人 token。
 
 # In[16]:
 
@@ -271,15 +285,16 @@ if False: model.save_pretrained_merged("model", tokenizer, save_method = "lora",
 if False: model.push_to_hub_merged("hf/model", tokenizer, save_method = "lora", token = "")
 
 
-# ### GGUF / llama.cpp Conversion
-# To save to `GGUF` / `llama.cpp`, we support it natively now! We clone `llama.cpp` and we default save it to `q8_0`. We allow all methods like `q4_k_m`. Use `save_pretrained_gguf` for local saving and `push_to_hub_gguf` for uploading to HF.
+# ### GGUF / llama.cpp 转换
+# 原生支持保存为 GGUF / llama.cpp 使用的格式，默认量化为 `q8_0`，也支持 `q4_k_m` 等多种方法。
+# 本地保存使用 `save_pretrained_gguf`，推送到 Hugging Face 使用 `push_to_hub_gguf`。
 # 
-# Some supported quant methods (full list on our [Wiki page](https://github.com/unslothai/unsloth/wiki#gguf-quantization-options)):
-# * `q8_0` - Fast conversion. High resource use, but generally acceptable.
-# * `q4_k_m` - Recommended. Uses Q6_K for half of the attention.wv and feed_forward.w2 tensors, else Q4_K.
-# * `q5_k_m` - Recommended. Uses Q6_K for half of the attention.wv and feed_forward.w2 tensors, else Q5_K.
+# 常用量化方法（完整列表见 Wiki：https://github.com/unslothai/unsloth/wiki#gguf-quantization-options）：
+# * `q8_0`：转换速度快，资源占用较高，但通常可接受。
+# * `q4_k_m`：推荐，对 attention.wv 与 feed_forward.w2 的一半使用 Q6_K，其余使用 Q4_K。
+# * `q5_k_m`：推荐，对 attention.wv 与 feed_forward.w2 的一半使用 Q6_K，其余使用 Q5_K。
 # 
-# [**NEW**] To finetune and auto export to Ollama, try our [Ollama notebook](https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/Llama3_(8B)-Ollama.ipynb)
+# 【新】若希望微调并自动导出到 Ollama，可参考官方 Ollama Notebook 示例。
 
 # In[17]:
 
@@ -312,21 +327,12 @@ if False:
     )
 
 
-# Now, use the `model-unsloth.gguf` file or `model-unsloth-Q4_K_M.gguf` file in llama.cpp or a UI based system like Jan or Open WebUI. You can install Jan [here](https://github.com/janhq/jan) and Open WebUI [here](https://github.com/open-webui/open-webui)
+# 现在可在 llama.cpp 或 UI 系统（如 Jan / Open WebUI）中使用生成的 GGUF 文件。
+# Jan 安装：https://github.com/janhq/jan ，Open WebUI：https://github.com/open-webui/open-webui
 # 
-# And we're done! If you have any questions on Unsloth, we have a [Discord](https://discord.gg/unsloth) channel! If you find any bugs or want to keep updated with the latest LLM stuff, or need help, join projects etc, feel free to join our Discord!
-# 
-# Some other links:
-# 1. Train your own reasoning model - Llama GRPO notebook [Free Colab](https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/Llama3.1_(8B)-GRPO.ipynb)
-# 2. Saving finetunes to Ollama. [Free notebook](https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/Llama3_(8B)-Ollama.ipynb)
-# 3. Llama 3.2 Vision finetuning - Radiography use case. [Free Colab](https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/Llama3.2_(11B)-Vision.ipynb)
-# 6. See notebooks for DPO, ORPO, Continued pretraining, conversational finetuning and more on our [documentation](https://docs.unsloth.ai/get-started/unsloth-notebooks)!
-# 
-# <div class="align-center">
-#   <a href="https://unsloth.ai"><img src="https://github.com/unslothai/unsloth/raw/main/images/unsloth%20new%20logo.png" width="115"></a>
-#   <a href="https://discord.gg/unsloth"><img src="https://github.com/unslothai/unsloth/raw/main/images/Discord.png" width="145"></a>
-#   <a href="https://docs.unsloth.ai/"><img src="https://github.com/unslothai/unsloth/blob/main/images/documentation%20green%20button.png?raw=true" width="125"></a>
-# 
-#   Join Discord if you need help + ⭐️ <i>Star us on <a href="https://github.com/unslothai/unsloth">Github</a> </i> ⭐️
-# </div>
-# 
+# 到此结束。如需帮助或关注最新动态，可加入 Unsloth 的 Discord 频道。
+# 更多示例：
+# 1. 推理微调 - Llama GRPO（免费 Colab 示例）
+# 2. 微调后导出至 Ollama（免费 Notebook 示例）
+# 3. 视觉微调 - Llama 3.2 Radiography 用例（免费 Colab 示例）
+# 以及 DPO/ORPO/继续预训练/对话式微调等，详见官方文档。
