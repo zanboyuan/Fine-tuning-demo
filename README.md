@@ -89,9 +89,33 @@ python Qwen3-4B_Alpaca-2.py
   - `local_files_only=True`：仅离线加载；若需在线下载，设为 `False`。
 
 - LoRA 参数
-  - `r=16`，`lora_alpha=16`，`lora_dropout=0`，`bias="none"`。
-  - `target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]`。
-  - `use_gradient_checkpointing="unsloth"`：显存优化（约 30%）。
+- `r=16`，`lora_alpha=16`，`lora_dropout=0`，`bias="none"`。
+- `target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]`。
+- `use_gradient_checkpointing="unsloth"`：显存优化（约 30%）。
+
+### LoRA 参数含义与调优建议
+
+- `r`（秩/低维）：决定适配器容量与显存/计算开销。越大拟合能力越强，但更耗显存与时间。常用范围 8–64；当前值 `16` 属于稳健中档。
+- `target_modules`：在这些层插入 LoRA。`q_proj/k_proj/v_proj/o_proj` 属于注意力投影层，`gate_proj/up_proj/down_proj` 属于前馈（MLP）层。覆盖注意力+MLP 通常效果更好，但显存占用最高。
+- `lora_alpha`（缩放系数）：有效缩放约为 `lora_alpha / r`，控制 LoRA 分支输出幅度。`alpha=16` 且 `r=16`，有效缩放≈1，较为均衡。
+- `lora_dropout`：仅作用于 LoRA 分支的 dropout（训练时启用，推理关闭）。`0` 适合小数据或希望最大化拟合；若过拟合可设 `0.05–0.1`。
+- `bias`：是否训练偏置。`"none"` 不更新偏置，省显存且更稳；`"all"` 训练全部偏置；`"lora_only"` 仅为 LoRA 分支加偏置。一般推荐 `"none"`。
+- `use_gradient_checkpointing`：梯度检查点策略。`"unsloth"` 使用优化实现，可降低约 30% 显存占用，但训练耗时会略增。
+- `random_state`（随机种子）：保证初始化与数据打乱的可复现性，便于对比实验与复现。
+- `use_rslora`：是否启用 Rank‑Stabilized LoRA（RS‑LoRA）。用于稳定不同 `r` 配置下的训练与收敛。为 `False` 时使用常规 LoRA。
+- `loftq_config`：LoFTQ（面向 LoRA 微调的量化）配置。与 `4bit` 量化（如 QLoRA）协同，以减轻量化带来的精度损失；`None` 表示不启用。
+
+调参建议：
+- 显存吃紧：仅在注意力层使用 LoRA（如 `["q_proj","v_proj","o_proj"]`），或将 `r` 降至 `8–12`。
+- 训练不稳定或梯度爆炸：开启 `use_rslora=True`，并将 `lora_dropout` 提高到 `0.05` 左右。
+- 欠拟合：提升 `r` 至 `32`，或将 `lora_alpha` 增至 `32`（保持 `alpha/r≈1` 或略大）。
+- 过拟合：提高 `lora_dropout`、缩小 `target_modules` 覆盖范围，或降低 `alpha/r`。
+- 长序列/大批次：保持 `use_gradient_checkpointing="unsloth"`，必要时适当减小 `r` 控制显存。
+- 计划量化部署：结合 QLoRA 时提供合适的 `loftq_config`，以减少量化后精度回退。
+
+快速判断与当前配置：
+- 建议让有效缩放 `lora_alpha / r` 落在 `0.5–2` 区间，通常更稳。
+- 当前配置（`r=16`、`alpha=16`、`dropout=0`、覆盖注意力+MLP）在中等规模数据与显存充足场景下较为平衡；若数据较小或易过拟合，建议将 `dropout` 先调至 `0.05` 做对比实验。
 
 - 训练参数（`transformers.TrainingArguments`）
   - `per_device_train_batch_size=2`，`gradient_accumulation_steps=4`。
@@ -99,6 +123,39 @@ python Qwen3-4B_Alpaca-2.py
   - `learning_rate=2e-4`，`optim="adamw_8bit"`，`weight_decay=0.01`。
   - 精度：`fp16 = not is_bfloat16_supported()`，`bf16 = is_bfloat16_supported()`。
   - `lr_scheduler_type="linear"`，`seed=3407`，`logging_steps=1`，`output_dir="outputs"`。
+
+### 训练参数含义与调优建议（TrainingArguments）
+
+- `per_device_train_batch_size`：每张 GPU/每个进程的微批大小。与 `gradient_accumulation_steps` 和设备数共同决定有效批次大小。
+- `gradient_accumulation_steps`：梯度累积步数。每累积 N 个微批执行一次优化更新，在显存有限时模拟更大的批次。
+- `warmup_steps`：线性预热步数，前 N 步将学习率从 0 升至目标值，缓解初期不稳定。也可用 `warmup_ratio`（如 0.03–0.1）。
+- `max_steps`：总优化步数；当 > 0 时会覆盖 `num_train_epochs`，到达该步数后停止训练。
+- `num_train_epochs`：训练轮数；仅在 `max_steps <= 0` 时生效。二者不建议同时设为正值。
+- `learning_rate`：学习率。LoRA/QLoRA 常用范围 `1e-4 ~ 3e-4`，较大数据/更长训练可适当降低；小数据/专业领域（如医疗）建议 `1e-4 ~ 2e-4` 更稳。
+- `fp16/bf16`：混合精度。Ampere+ GPU 倾向使用 BF16（稳定性更好）；否则使用 FP16。示例写法保证两者只会启用其一。
+- `logging_steps`：日志打印间隔（以优化步为单位）。数值越小日志越密集、开销略增；可设为 10–50 以平衡噪声与性能。
+- `optim`：优化器。`adamw_8bit` 使用 bitsandbytes 的 8-bit 优化器，显存友好；在不支持环境（如部分 Windows）可改为 `adamw_torch`。
+- `weight_decay`：权重衰减。LoRA 仅训练少量参数，`0.0 ~ 0.01` 常见；过大可能抑制适配器学习。
+- `lr_scheduler_type`：学习率调度器。`linear` 预热后线性下降；`cosine`/`cosine_with_restarts` 更平滑，后期泛化常更好。
+- `seed`：随机种子，保证初始化与数据打乱的可复现。
+- `output_dir`：训练输出目录。
+- `report_to`：训练日志上报目标。`"none"` 不上报；可设为 `"wandb"`、`"tensorboard"` 等。
+
+关键关系：
+- 有效批次大小（单机）≈ `per_device_train_batch_size × gradient_accumulation_steps`；多卡需再乘以设备数（world size）。
+- 每个 epoch 的优化步数 ≈ `ceil(样本数 / 有效批次大小)`。
+- 当 `max_steps > 0` 时优先生效，`num_train_epochs` 被忽略；若希望按轮数训练，请将 `max_steps` 设为 `-1`。
+
+调优建议：
+- 显存与吞吐：显存吃紧时先降 `per_device_train_batch_size` 并提 `gradient_accumulation_steps` 保持有效批次；必要时降低序列长度与 LoRA 覆盖范围（见上文 LoRA 小节）。
+- 学习率与调度：小数据/易过拟合任务（如医学指令集）建议 `learning_rate=1e-4 ~ 2e-4`、增大 `warmup_steps` 或 `warmup_ratio`（3%–10%）；大数据/长训练倾向 `cosine` 或 `cosine_with_restarts`。
+- 训练步数 vs 轮数：若需精确控制预算，用 `max_steps`（如 240/1000/5000）；若需按轮数训练，设 `max_steps=-1` 并用 `num_train_epochs`。
+- 精度与优化器：支持 BF16 的 GPU 建议 `bf16=True, fp16=False`；Windows/bitsandbytes 不可用时，将 `optim` 改为 `adamw_torch`，并参考下文 4bit 兼容提示。
+- 正则化与稳定性：LoRA 通常不需要较大 `weight_decay`；初期震荡或损失不降时，增大 `warmup_steps`、降低 `learning_rate`，或在 LoRA 配置中适度提高 `lora_dropout`。
+- 监控与可视化：将 `report_to` 设为 `"wandb"` 或 `"tensorboard"` 开启可视化；将 `logging_steps` 设为 10–50 以减少噪声并提升吞吐。
+
+示例提示：
+- 若脚本中同时设置了 `max_steps` 与 `num_train_epochs`，训练会在达到 `max_steps` 后提前停止；想跑满若干 epoch，请将 `max_steps=-1`。
 
 - 数据模板（Alpaca）
   - 模板字段：`instruction`、`input`、`output`。
